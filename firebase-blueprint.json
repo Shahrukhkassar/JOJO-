@@ -86,7 +86,7 @@
         },
         "emotion": {
           "type": "string",
-          "enum": ["caring", "playful", "cheerful", "encouraging", "calm", "enthusiastic", "study", "thoughtful"],
+          "enum": ["caring", "playful", "cheerful", "encouraging", "calm", "enthusiastic", "study", "thoughtful", "happy", "focused"],
           "description": "Associated emotion state"
         },
         "language": {
