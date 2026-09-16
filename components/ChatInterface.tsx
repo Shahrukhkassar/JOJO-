@@ -14,12 +14,14 @@ import {
   RefreshCw,
   Heart,
   Lightbulb,
-  CheckCircle,
-  HelpCircle,
-  Coffee,
-  Smile,
   Zap,
+  LogIn,
+  LogOut,
+  Cloud,
+  Check,
+  Bookmark,
 } from 'lucide-react';
+import { collection, query, orderBy, limit, onSnapshot } from 'firebase/firestore';
 import JojoAvatar, { JojoEmotion } from '@/components/Avatar';
 import QuizCard, { QuizData } from '@/components/QuizCard';
 import VoiceSettingsModal from '@/components/VoiceSettingsModal';
@@ -30,6 +32,16 @@ import {
   speakText,
   stopSpeaking,
 } from '@/lib/speech';
+import {
+  db,
+  persistChatMessage,
+  persistStudyNote,
+  persistQuizResult,
+  handleFirestoreError,
+  OperationType,
+  FirestoreChatMessage,
+} from '@/lib/firebase';
+import { useFirebase } from '@/components/FirebaseProvider';
 
 export interface ChatMessage {
   id: string;
@@ -49,11 +61,11 @@ type UserMoodState = 'normal' | 'tired' | 'stressed' | 'happy';
 let messageCounter = 0;
 function createId(prefix: string): string {
   messageCounter += 1;
-  return `${prefix}-${messageCounter}`;
+  return `${prefix}-${Date.now().toString(36)}-${messageCounter}`;
 }
 
-function getFormattedTime(): string {
-  const d = new Date();
+function getFormattedTime(dateObj?: Date): string {
+  const d = dateObj || new Date();
   const hours = d.getHours();
   const minutes = d.getMinutes();
   const ampm = hours >= 12 ? 'PM' : 'AM';
@@ -74,6 +86,8 @@ interface SpeechRecognitionInstance {
 }
 
 export default function ChatInterface() {
+  const { user, userProfile, signIn, signOut, updateSettings } = useFirebase();
+
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: 'welcome-msg',
@@ -91,6 +105,7 @@ export default function ChatInterface() {
   const [currentEmotion, setCurrentEmotion] = useState<JojoEmotion>('caring');
   const [activeMode, setActiveMode] = useState<ChatMode>('casual');
   const [userMood, setUserMood] = useState<UserMoodState>('normal');
+  const [savedNotesMap, setSavedNotesMap] = useState<Record<string, boolean>>({});
 
   // Voice State
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
@@ -121,6 +136,11 @@ export default function ChatInterface() {
     scrollToBottom();
   }, [messages, loading]);
 
+  // Effective voice preferences (derived from userProfile if authenticated)
+  const effectiveVoiceRate = userProfile?.preferredVoiceSpeed ?? voiceRate;
+  const effectiveVoicePitch = userProfile?.preferredPitch ?? voicePitch;
+  const effectiveAutoSpeak = userProfile?.autoPlayVoice ?? autoSpeak;
+
   // Load Voices on Mount
   useEffect(() => {
     const updateVoices = () => {
@@ -138,11 +158,50 @@ export default function ChatInterface() {
     }
   }, [selectedVoice]);
 
+  // Real-time messages sync from Firestore for authenticated users
+  useEffect(() => {
+    if (!user) return;
+
+    const messagesPath = `users/${user.uid}/messages`;
+    const q = query(
+      collection(db, 'users', user.uid, 'messages'),
+      orderBy('createdAt', 'asc'),
+      limit(50)
+    );
+
+    const unsubscribe = onSnapshot(
+      q,
+      (snapshot) => {
+        if (!snapshot.empty) {
+          const loaded: ChatMessage[] = [];
+          snapshot.forEach((docSnap) => {
+            const data = docSnap.data() as FirestoreChatMessage;
+            loaded.push({
+              id: data.id,
+              role: data.role,
+              content: data.content,
+              emotion: data.emotion as JojoEmotion,
+              language: data.language,
+              timestamp: getFormattedTime(new Date(data.createdAt)),
+            });
+          });
+          setMessages(loaded);
+        }
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.LIST, messagesPath);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [user]);
+
   // Initialize Speech Recognition
   useEffect(() => {
     if (typeof window !== 'undefined') {
       const windowObj = window as unknown as Record<string, unknown>;
-      const SpeechRecognitionConstructor = (windowObj.SpeechRecognition || windowObj.webkitSpeechRecognition) as {
+      const SpeechRecognitionConstructor = (windowObj.SpeechRecognition ||
+        windowObj.webkitSpeechRecognition) as {
         new (): {
           continuous: boolean;
           interimResults: boolean;
@@ -154,6 +213,7 @@ export default function ChatInterface() {
           stop: () => void;
         };
       };
+
       if (SpeechRecognitionConstructor) {
         const recognition = new SpeechRecognitionConstructor();
         recognition.continuous = false;
@@ -187,10 +247,7 @@ export default function ChatInterface() {
       return;
     }
 
-    const recognition = recognitionRef.current as {
-      start: () => void;
-      stop: () => void;
-    };
+    const recognition = recognitionRef.current;
     if (isListening) {
       recognition.stop();
       setIsListening(false);
@@ -235,9 +292,51 @@ export default function ChatInterface() {
     });
   };
 
-  // Send message
-  const handleSend = async (customText?: string) => {
-    const textToSend = (customText || input).trim();
+  const handleSaveStudyInsight = async (msgId: string, insightContent: string) => {
+    if (!user) {
+      await signIn();
+      return;
+    }
+
+    try {
+      await persistStudyNote(user.uid, {
+        id: createId('note'),
+        userId: user.uid,
+        title: insightContent.slice(0, 60) + (insightContent.length > 60 ? '...' : ''),
+        topic: activeMode === 'study_bams' ? 'BAMS Sharir' : 'Revision Insight',
+        content: insightContent,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      setSavedNotesMap((prev) => ({ ...prev, [msgId]: true }));
+    } catch (err) {
+      console.error('Failed to save study note:', err);
+    }
+  };
+
+  const handleQuizAnswerRecorded = (result: {
+    question: string;
+    selectedOption: string;
+    correctOption: string;
+    isCorrect: boolean;
+    explanation: string;
+  }) => {
+    if (user) {
+      persistQuizResult(user.uid, {
+        id: createId('quiz'),
+        userId: user.uid,
+        question: result.question,
+        selectedOption: result.selectedOption,
+        correctOption: result.correctOption,
+        isCorrect: result.isCorrect,
+        explanation: result.explanation,
+        createdAt: new Date().toISOString(),
+      }).catch((err) => console.error('Error recording quiz:', err));
+    }
+  };
+
+  const handleSend = async (overrideText?: string) => {
+    const textToSend = (overrideText || input).trim();
     if (!textToSend || loading) return;
 
     setInput('');
@@ -246,6 +345,7 @@ export default function ChatInterface() {
       setIsListening(false);
     }
 
+    const nowIso = new Date().toISOString();
     const userMessage: ChatMessage = {
       id: createId('user'),
       role: 'user',
@@ -257,29 +357,47 @@ export default function ChatInterface() {
     setMessages(newHistory);
     setLoading(true);
 
+    // Persist user message to Firebase Firestore
+    if (user) {
+      persistChatMessage(user.uid, {
+        id: userMessage.id,
+        userId: user.uid,
+        role: 'user',
+        content: textToSend,
+        createdAt: nowIso,
+      }).catch((err) => console.error('Error saving user message to Firestore:', err));
+    }
+
     try {
-      const response = await fetch('/api/chat', {
+      const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: textToSend,
-          history: newHistory.map((m) => ({ role: m.role, content: m.content })),
+          conversationHistory: messages.slice(-8).map((m) => ({
+            role: m.role,
+            content: m.content,
+          })),
           mode: activeMode,
           userMood,
         }),
       });
 
-      const data = await response.json();
+      if (!res.ok) {
+        throw new Error('Network response was not ok');
+      }
 
-      const assistantEmotion = (data.emotion as JojoEmotion) || 'caring';
+      const data = await res.json();
+      const assistantEmotion = (data.emotion || 'caring') as JojoEmotion;
       setCurrentEmotion(assistantEmotion);
 
+      const assistantMsgId = createId('assistant');
       const assistantMessage: ChatMessage = {
-        id: createId('assistant'),
+        id: assistantMsgId,
         role: 'assistant',
         content: data.reply || data.fallbackReply || 'I am here with you ✨',
         emotion: assistantEmotion,
-        language: data.language || 'English',
+        language: data.language || 'Hinglish',
         gentleCorrection: data.gentleCorrection,
         studyInsight: data.studyInsight,
         quiz: data.quiz,
@@ -288,24 +406,22 @@ export default function ChatInterface() {
 
       setMessages((prev) => [...prev, assistantMessage]);
 
-      // Auto-speak if enabled
-      if (autoSpeak) {
-        setCurrentlySpeakingId(assistantMessage.id);
-        setIsSpeaking(true);
-        speakText(assistantMessage.content, {
-          voice: selectedVoice,
-          rate: voiceRate,
-          pitch: voicePitch,
-          onStart: () => setIsSpeaking(true),
-          onEnd: () => {
-            setIsSpeaking(false);
-            setCurrentlySpeakingId(null);
-          },
-          onError: () => {
-            setIsSpeaking(false);
-            setCurrentlySpeakingId(null);
-          },
-        });
+      // Persist assistant message to Firebase Firestore
+      if (user) {
+        persistChatMessage(user.uid, {
+          id: assistantMsgId,
+          userId: user.uid,
+          role: 'assistant',
+          content: assistantMessage.content,
+          emotion: assistantMessage.emotion,
+          language: assistantMessage.language,
+          createdAt: new Date().toISOString(),
+        }).catch((err) => console.error('Error saving assistant message to Firestore:', err));
+      }
+
+      // Auto-speak reply if enabled
+      if (autoSpeak && assistantMessage.content) {
+        handlePlayMessageAudio(assistantMessage);
       }
     } catch {
       const fallbackMsg: ChatMessage = {
@@ -348,7 +464,7 @@ export default function ChatInterface() {
       {/* Top Header */}
       <header
         id="jojo-header"
-        className="shrink-0 px-4 py-3 bg-white/80 backdrop-blur-md border-b border-rose-100 flex items-center justify-between z-20 shadow-xs"
+        className="shrink-0 px-4 py-2.5 bg-white/85 backdrop-blur-md border-b border-rose-100 flex items-center justify-between z-20 shadow-2xs"
       >
         {/* Left: Avatar & Identity */}
         <div className="flex items-center gap-3">
@@ -358,7 +474,6 @@ export default function ChatInterface() {
             isThinking={loading}
             size="md"
             onClick={() => {
-              // Delightful poke reaction
               setCurrentEmotion('playful');
               speakText('Hehe, sending you a warm hug!', { voice: selectedVoice });
             }}
@@ -366,9 +481,18 @@ export default function ChatInterface() {
           <div>
             <div className="flex items-center gap-2">
               <h1 className="text-base font-bold tracking-tight text-slate-900">Jojo</h1>
-              <span className="px-2 py-0.5 rounded-full text-[11px] font-medium bg-rose-100/80 text-rose-700 border border-rose-200/60">
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-rose-100/80 text-rose-700 border border-rose-200/60">
                 AI Companion
               </span>
+              {user && (
+                <span
+                  title="Synced with Firebase Firestore"
+                  className="hidden md:inline-flex items-center gap-1 text-[10px] font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full"
+                >
+                  <Cloud className="w-3 h-3 text-emerald-500" />
+                  Synced
+                </span>
+              )}
             </div>
             <div className="flex items-center gap-1.5 text-xs text-slate-500">
               <span
@@ -380,7 +504,7 @@ export default function ChatInterface() {
                     : 'bg-emerald-500'
                 }`}
               />
-              <span className="capitalize">
+              <span className="capitalize text-[11px] sm:text-xs">
                 {isSpeaking
                   ? 'Speaking with you 🎙️'
                   : loading
@@ -391,14 +515,14 @@ export default function ChatInterface() {
           </div>
         </div>
 
-        {/* Center: Mode Switcher (Hidden on very small screens, visible on md) */}
+        {/* Center: Mode Switcher */}
         <div className="hidden sm:flex items-center p-1 rounded-xl bg-slate-100/90 border border-slate-200/70 text-xs">
           <button
             id="mode-casual-btn"
             onClick={() => setActiveMode('casual')}
             className={`px-3 py-1.5 rounded-lg font-medium transition-all ${
               activeMode === 'casual'
-                ? 'bg-white text-rose-700 shadow-xs'
+                ? 'bg-white text-rose-700 shadow-2xs'
                 : 'text-slate-600 hover:text-slate-900'
             }`}
           >
@@ -409,7 +533,7 @@ export default function ChatInterface() {
             onClick={() => setActiveMode('study_bams')}
             className={`px-3 py-1.5 rounded-lg font-medium transition-all ${
               activeMode === 'study_bams'
-                ? 'bg-white text-emerald-700 shadow-xs'
+                ? 'bg-white text-emerald-700 shadow-2xs'
                 : 'text-slate-600 hover:text-slate-900'
             }`}
           >
@@ -420,7 +544,7 @@ export default function ChatInterface() {
             onClick={() => setActiveMode('english_practice')}
             className={`px-3 py-1.5 rounded-lg font-medium transition-all ${
               activeMode === 'english_practice'
-                ? 'bg-white text-indigo-700 shadow-xs'
+                ? 'bg-white text-indigo-700 shadow-2xs'
                 : 'text-slate-600 hover:text-slate-900'
             }`}
           >
@@ -428,14 +552,14 @@ export default function ChatInterface() {
           </button>
         </div>
 
-        {/* Right: Actions */}
+        {/* Right: Actions & User Auth */}
         <div className="flex items-center gap-1.5">
           {/* Study Deck Opener */}
           <button
             id="open-study-deck-btn"
             onClick={() => setIsStudyDeckOpen(true)}
             className="p-2 rounded-xl text-slate-600 hover:text-rose-600 hover:bg-rose-50 border border-slate-200 transition-colors"
-            title="BAMS Syllabus &amp; Study Hub"
+            title="BAMS Syllabus & Study Hub"
           >
             <BookOpen className="w-4 h-4" />
           </button>
@@ -448,7 +572,11 @@ export default function ChatInterface() {
                 stopSpeaking();
                 setIsSpeaking(false);
               }
-              setAutoSpeak(!autoSpeak);
+              const nextVal = !autoSpeak;
+              setAutoSpeak(nextVal);
+              if (user) {
+                updateSettings({ autoPlayVoice: nextVal });
+              }
             }}
             className={`p-2 rounded-xl border transition-colors ${
               autoSpeak
@@ -465,7 +593,7 @@ export default function ChatInterface() {
             id="open-voice-settings-btn"
             onClick={() => setIsVoiceModalOpen(true)}
             className="p-2 rounded-xl text-slate-600 hover:text-slate-900 hover:bg-slate-100 border border-slate-200 transition-colors"
-            title="Voice &amp; Speech Settings"
+            title="Voice & Speech Settings"
           >
             <Settings2 className="w-4 h-4" />
           </button>
@@ -479,11 +607,51 @@ export default function ChatInterface() {
           >
             <RefreshCw className="w-4 h-4" />
           </button>
+
+          {/* Google Auth Status / Sign In Button */}
+          {user ? (
+            <div className="flex items-center gap-1.5 pl-1.5 border-l border-slate-200">
+              <div
+                title={`Signed in as ${user.displayName || user.email}`}
+                className="w-8 h-8 rounded-full bg-rose-500 text-white flex items-center justify-center text-xs font-bold ring-2 ring-rose-200"
+              >
+                {user.photoURL ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={user.photoURL}
+                    alt={user.displayName || 'User'}
+                    className="w-full h-full rounded-full object-cover"
+                    referrerPolicy="no-referrer"
+                  />
+                ) : (
+                  (user.displayName || user.email || 'U')[0].toUpperCase()
+                )}
+              </div>
+              <button
+                id="firebase-signout-btn"
+                onClick={signOut}
+                className="p-2 rounded-xl text-slate-400 hover:text-rose-600 hover:bg-rose-50 border border-slate-200 transition-colors"
+                title="Sign Out"
+              >
+                <LogOut className="w-4 h-4" />
+              </button>
+            </div>
+          ) : (
+            <button
+              id="firebase-signin-btn"
+              onClick={signIn}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-rose-500 hover:bg-rose-600 text-white text-xs font-semibold shadow-2xs transition-colors"
+              title="Sign in with Google to sync with Firebase"
+            >
+              <LogIn className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Sign In</span>
+            </button>
+          )}
         </div>
       </header>
 
       {/* Mobile Mode Selector Row */}
-      <div className="sm:hidden px-3 py-2 bg-white/60 border-b border-rose-100 flex items-center justify-around text-xs">
+      <div className="sm:hidden px-3 py-1.5 bg-white/60 border-b border-rose-100 flex items-center justify-around text-xs">
         <button
           onClick={() => setActiveMode('casual')}
           className={`px-2.5 py-1 rounded-md font-medium ${
@@ -511,42 +679,62 @@ export default function ChatInterface() {
       </div>
 
       {/* User Mood Bar & Quick Context */}
-      <div className="shrink-0 px-4 py-2 bg-amber-50/50 border-b border-amber-100/60 flex items-center justify-between text-xs overflow-x-auto gap-2">
+      <div className="shrink-0 px-4 py-1.5 bg-amber-50/50 border-b border-amber-100/60 flex items-center justify-between text-xs overflow-x-auto gap-2">
         <div className="flex items-center gap-1.5 text-slate-600 shrink-0">
           <Heart className="w-3.5 h-3.5 text-rose-500" />
           <span className="font-medium">How are you feeling?</span>
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
           {[
-            { id: 'normal', label: 'Balanced 🌸' },
-            { id: 'tired', label: 'Tired 🥱' },
-            { id: 'stressed', label: 'Stressed 😣' },
-            { id: 'happy', label: 'Happy ☀️' },
+            { key: 'normal', label: '😊 Good / Balanced', emoji: '😊' },
+            { key: 'tired', label: '🥱 Tired / Exhausted', emoji: '🥱' },
+            { key: 'stressed', label: '😣 Stressed / Exam Panic', emoji: '😣' },
+            { key: 'happy', label: '🥳 Happy & Energetic', emoji: '🥳' },
           ].map((m) => (
             <button
-              key={m.id}
-              onClick={() => setUserMood(m.id as UserMoodState)}
-              className={`px-2.5 py-1 rounded-full text-xs font-medium transition-colors ${
-                userMood === m.id
-                  ? 'bg-rose-500 text-white shadow-xs'
-                  : 'bg-white/80 text-slate-600 hover:bg-white border border-amber-200/60'
+              key={m.key}
+              onClick={() => setUserMood(m.key as UserMoodState)}
+              className={`px-2.5 py-1 rounded-full text-xs font-medium transition-all flex items-center gap-1 ${
+                userMood === m.key
+                  ? 'bg-amber-200 text-amber-900 border border-amber-300 shadow-2xs font-semibold'
+                  : 'bg-white/80 text-slate-600 hover:bg-amber-100/60 border border-amber-100'
               }`}
             >
-              {m.label}
+              <span>{m.emoji}</span>
+              <span className="hidden md:inline">{m.label.split(' ')[1]}</span>
             </button>
           ))}
         </div>
       </div>
 
-      {/* Chat Messages Flow */}
+      {/* Cloud Sync Announcement if guest */}
+      {!user && (
+        <div className="shrink-0 px-4 py-1.5 bg-rose-50/70 border-b border-rose-100/80 flex items-center justify-between text-xs text-rose-800">
+          <div className="flex items-center gap-2">
+            <Cloud className="w-3.5 h-3.5 text-rose-500 shrink-0" />
+            <span>
+              <strong>Firebase Firestore is active!</strong> Sign in with Google to sync your study notes, chat logs, and quiz results across devices.
+            </span>
+          </div>
+          <button
+            onClick={signIn}
+            className="text-xs font-bold text-rose-700 hover:text-rose-900 underline underline-offset-2 shrink-0 ml-2"
+          >
+            Connect now
+          </button>
+        </div>
+      )}
+
+      {/* Main Chat Scroll View */}
       <main
-        id="jojo-chat-stream"
-        className="flex-1 overflow-y-auto px-4 py-4 md:px-8 space-y-4 max-w-4xl w-full mx-auto"
+        id="jojo-messages-container"
+        className="flex-1 overflow-y-auto px-4 py-4 space-y-4 max-w-4xl w-full mx-auto"
       >
         <AnimatePresence initial={false}>
           {messages.map((msg) => {
             const isUser = msg.role === 'user';
-            const isThisSpeaking = currentlySpeakingId === msg.id && isSpeaking;
+            const isThisSpeaking = isSpeaking && currentlySpeakingId === msg.id;
+            const isNoteSaved = savedNotesMap[msg.id];
 
             return (
               <motion.div
@@ -569,10 +757,10 @@ export default function ChatInterface() {
 
                 {/* Message Bubble */}
                 <div
-                  className={`max-w-[85%] sm:max-w-[75%] rounded-2xl p-4 shadow-xs transition-all ${
+                  className={`max-w-[85%] sm:max-w-[75%] rounded-2xl p-4 shadow-2xs transition-all ${
                     isUser
                       ? 'bg-gradient-to-br from-slate-900 to-slate-800 text-white rounded-tr-none'
-                      : 'bg-white border border-rose-100 text-slate-800 rounded-tl-none shadow-sm'
+                      : 'bg-white border border-rose-100 text-slate-800 rounded-tl-none shadow-xs'
                   }`}
                 >
                   {/* Assistant Message Header / Tags */}
@@ -620,11 +808,28 @@ export default function ChatInterface() {
 
                   {/* BAMS Golden Nugget / Study Insight (if provided) */}
                   {msg.studyInsight && (
-                    <div className="mt-3 p-2.5 rounded-lg bg-emerald-50/80 border border-emerald-200/70 text-emerald-900 text-xs flex items-start gap-2">
-                      <Lightbulb className="w-3.5 h-3.5 text-emerald-600 shrink-0 mt-0.5" />
-                      <div>
-                        <span className="font-semibold block mb-0.5">Ayurvedic Insight:</span>
-                        <span>{msg.studyInsight}</span>
+                    <div className="mt-3 p-2.5 rounded-lg bg-emerald-50/80 border border-emerald-200/70 text-emerald-900 text-xs">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="flex items-start gap-2">
+                          <Lightbulb className="w-3.5 h-3.5 text-emerald-600 shrink-0 mt-0.5" />
+                          <div>
+                            <span className="font-semibold block mb-0.5">Ayurvedic Insight:</span>
+                            <span>{msg.studyInsight}</span>
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => handleSaveStudyInsight(msg.id, msg.studyInsight!)}
+                          disabled={isNoteSaved}
+                          className={`shrink-0 px-2 py-1 rounded text-[11px] font-medium border flex items-center gap-1 transition-colors ${
+                            isNoteSaved
+                              ? 'bg-emerald-200 text-emerald-900 border-emerald-300'
+                              : 'bg-white hover:bg-emerald-100 text-emerald-800 border-emerald-300'
+                          }`}
+                          title="Save note to Firebase Firestore"
+                        >
+                          {isNoteSaved ? <Check className="w-3 h-3" /> : <Bookmark className="w-3 h-3" />}
+                          <span>{isNoteSaved ? 'Saved' : 'Save Note'}</span>
+                        </button>
                       </div>
                     </div>
                   )}
@@ -633,6 +838,7 @@ export default function ChatInterface() {
                   {msg.quiz && (
                     <QuizCard
                       quiz={msg.quiz}
+                      onQuizAnswered={handleQuizAnswerRecorded}
                       onAskDeeper={(q) =>
                         handleSend(`Jojo, can you explain the clinical reasoning behind: "${q}"?`)
                       }
@@ -661,7 +867,7 @@ export default function ChatInterface() {
             className="flex items-center gap-3"
           >
             <JojoAvatar emotion={currentEmotion} isSpeaking={false} isThinking={true} size="sm" />
-            <div className="px-4 py-3 rounded-2xl rounded-tl-none bg-white border border-rose-100 shadow-xs flex items-center gap-2 text-xs text-slate-500">
+            <div className="px-4 py-3 rounded-2xl rounded-tl-none bg-white border border-rose-100 shadow-2xs flex items-center gap-2 text-xs text-slate-500">
               <span className="w-2 h-2 rounded-full bg-rose-400 animate-bounce" />
               <span
                 className="w-2 h-2 rounded-full bg-rose-400 animate-bounce"
@@ -706,7 +912,7 @@ export default function ChatInterface() {
       {/* Message Input Bar */}
       <footer
         id="jojo-input-bar"
-        className="shrink-0 px-4 py-3 bg-white border-t border-slate-200 shadow-sm z-20"
+        className="shrink-0 px-4 py-3 bg-white border-t border-slate-200 shadow-xs z-20"
       >
         <div className="max-w-4xl mx-auto flex items-end gap-2.5">
           {/* Microphone Dictation Button */}
@@ -750,10 +956,10 @@ export default function ChatInterface() {
             id="jojo-send-button"
             onClick={() => handleSend()}
             disabled={!input.trim() || loading}
-            className={`p-3 rounded-xl font-medium transition-all shrink-0 ${
-              input.trim() && !loading
-                ? 'bg-rose-500 text-white shadow-md hover:bg-rose-600'
-                : 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed'
+            className={`p-3 rounded-xl transition-all shrink-0 flex items-center justify-center ${
+              !input.trim() || loading
+                ? 'bg-slate-100 text-slate-300 cursor-not-allowed'
+                : 'bg-rose-500 hover:bg-rose-600 text-white shadow-sm'
             }`}
             title="Send Message"
           >
@@ -768,23 +974,29 @@ export default function ChatInterface() {
         onClose={() => setIsVoiceModalOpen(false)}
         voices={voices}
         selectedVoice={selectedVoice}
-        onSelectVoice={setSelectedVoice}
+        onSelectVoice={(v) => setSelectedVoice(v)}
         rate={voiceRate}
-        onChangeRate={setVoiceRate}
+        onChangeRate={(r) => {
+          setVoiceRate(r);
+          if (user) updateSettings({ preferredVoiceSpeed: r });
+        }}
         pitch={voicePitch}
-        onChangePitch={setVoicePitch}
+        onChangePitch={(p) => {
+          setVoicePitch(p);
+          if (user) updateSettings({ preferredPitch: p });
+        }}
         autoSpeak={autoSpeak}
-        onToggleAutoSpeak={setAutoSpeak}
+        onToggleAutoSpeak={(enabled) => {
+          setAutoSpeak(enabled);
+          if (user) updateSettings({ autoPlayVoice: enabled });
+        }}
       />
 
-      {/* Study Deck / Syllabus Hub Modal */}
+      {/* Study Deck Modal */}
       <StudyDeckModal
         isOpen={isStudyDeckOpen}
         onClose={() => setIsStudyDeckOpen(false)}
-        onSelectTopic={(prompt) => {
-          setActiveMode('study_bams');
-          handleSend(prompt);
-        }}
+        onSelectTopic={(prompt) => handleSend(prompt)}
       />
     </div>
   );

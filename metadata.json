@@ -1,6 +1,6 @@
 {
   "name": "Jojo - AI Companion",
-  "description": "A warm, charming, emotionally expressive AI companion and study partner.",
+  "description": "A warm, charming, emotionally expressive AI companion and study partner with Firebase persistence.",
   "requestFramePermissions": [
     "microphone"
   ],

@@ -1,0 +1,160 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Common security primitives
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isVerifiedOwner(userId) {
+      return isOwner(userId) && (request.auth.token.email_verified == true || request.auth.provider == 'anonymous');
+    }
+
+    // Entity validation helpers
+    function isValidUserProfile(data) {
+      return data.userId is string &&
+             data.userId == request.auth.uid &&
+             data.userId.size() <= 128 &&
+             data.displayName is string &&
+             data.displayName.size() <= 100 &&
+             data.email is string &&
+             data.email.size() <= 150 &&
+             (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 500)) &&
+             (!('preferredLanguage' in data) || (data.preferredLanguage in ['Hinglish', 'Hindi', 'English'])) &&
+             (!('preferredVoiceSpeed' in data) || (data.preferredVoiceSpeed is number)) &&
+             (!('preferredPitch' in data) || (data.preferredPitch is number)) &&
+             (!('autoPlayVoice' in data) || (data.autoPlayVoice is bool)) &&
+             data.createdAt is string &&
+             data.createdAt.size() <= 50 &&
+             data.updatedAt is string &&
+             data.updatedAt.size() <= 50;
+    }
+
+    function isValidChatMessage(data) {
+      return data.id is string &&
+             data.id.size() <= 128 &&
+             data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+             data.userId is string &&
+             data.userId == request.auth.uid &&
+             data.userId.size() <= 128 &&
+             data.role in ['user', 'assistant'] &&
+             data.content is string &&
+             data.content.size() <= 5000 &&
+             (!('emotion' in data) || (data.emotion in ['caring', 'playful', 'cheerful', 'encouraging', 'calm', 'enthusiastic', 'study', 'thoughtful'])) &&
+             (!('language' in data) || (data.language is string && data.language.size() <= 50)) &&
+             data.createdAt is string &&
+             data.createdAt.size() <= 50;
+    }
+
+    function isValidStudyNote(data) {
+      return data.id is string &&
+             data.id.size() <= 128 &&
+             data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+             data.userId is string &&
+             data.userId == request.auth.uid &&
+             data.userId.size() <= 128 &&
+             data.title is string &&
+             data.title.size() <= 200 &&
+             (!('topic' in data) || (data.topic is string && data.topic.size() <= 100)) &&
+             data.content is string &&
+             data.content.size() <= 5000 &&
+             data.createdAt is string &&
+             data.createdAt.size() <= 50 &&
+             data.updatedAt is string &&
+             data.updatedAt.size() <= 50;
+    }
+
+    function isValidQuizResult(data) {
+      return data.id is string &&
+             data.id.size() <= 128 &&
+             data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+             data.userId is string &&
+             data.userId == request.auth.uid &&
+             data.userId.size() <= 128 &&
+             data.question is string &&
+             data.question.size() <= 1000 &&
+             data.selectedOption is string &&
+             data.selectedOption.size() <= 200 &&
+             data.correctOption is string &&
+             data.correctOption.size() <= 200 &&
+             data.isCorrect is bool &&
+             (!('explanation' in data) || (data.explanation is string && data.explanation.size() <= 2000)) &&
+             data.createdAt is string &&
+             data.createdAt.size() <= 50;
+    }
+
+    // Users collection and subcollections
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow list: if false; // Disallow querying user accounts as a directory
+      allow create: if isVerifiedOwner(userId) &&
+                       isValidId(userId) &&
+                       isValidUserProfile(incoming()) &&
+                       incoming().userId == userId;
+      allow update: if isVerifiedOwner(userId) &&
+                       isValidUserProfile(incoming()) &&
+                       incoming().userId == existing().userId;
+      allow delete: if isVerifiedOwner(userId);
+
+      // Messages subcollection
+      match /messages/{messageId} {
+        allow get: if isOwner(userId);
+        allow list: if isOwner(userId);
+        allow create: if isVerifiedOwner(userId) &&
+                         isValidId(messageId) &&
+                         isValidChatMessage(incoming()) &&
+                         incoming().userId == userId;
+        allow update: if false; // Chat history is immutable
+        allow delete: if isVerifiedOwner(userId);
+      }
+
+      // Saved Study Notes subcollection
+      match /studyNotes/{noteId} {
+        allow get: if isOwner(userId);
+        allow list: if isOwner(userId);
+        allow create: if isVerifiedOwner(userId) &&
+                         isValidId(noteId) &&
+                         isValidStudyNote(incoming()) &&
+                         incoming().userId == userId;
+        allow update: if isVerifiedOwner(userId) &&
+                         isValidStudyNote(incoming()) &&
+                         incoming().userId == existing().userId;
+        allow delete: if isVerifiedOwner(userId);
+      }
+
+      // Quiz Results subcollection
+      match /quizResults/{resultId} {
+        allow get: if isOwner(userId);
+        allow list: if isOwner(userId);
+        allow create: if isVerifiedOwner(userId) &&
+                         isValidId(resultId) &&
+                         isValidQuizResult(incoming()) &&
+                         incoming().userId == userId;
+        allow update: if false; // Historical quiz records are immutable
+        allow delete: if isVerifiedOwner(userId);
+      }
+    }
+  }
+}

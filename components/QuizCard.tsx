@@ -14,9 +14,16 @@ export interface QuizData {
 interface QuizCardProps {
   quiz: QuizData;
   onAskDeeper?: (topic: string) => void;
+  onQuizAnswered?: (result: {
+    question: string;
+    selectedOption: string;
+    correctOption: string;
+    isCorrect: boolean;
+    explanation: string;
+  }) => void;
 }
 
-export default function QuizCard({ quiz, onAskDeeper }: QuizCardProps) {
+export default function QuizCard({ quiz, onAskDeeper, onQuizAnswered }: QuizCardProps) {
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [hasSubmitted, setHasSubmitted] = useState(false);
 
@@ -24,6 +31,16 @@ export default function QuizCard({ quiz, onAskDeeper }: QuizCardProps) {
     if (hasSubmitted) return;
     setSelectedIndex(index);
     setHasSubmitted(true);
+
+    if (onQuizAnswered) {
+      onQuizAnswered({
+        question: quiz.question,
+        selectedOption: quiz.options[index] || '',
+        correctOption: quiz.options[quiz.correctIndex] || '',
+        isCorrect: index === quiz.correctIndex,
+        explanation: quiz.explanation,
+      });
+    }
   };
 
   const isCorrect = selectedIndex !== null && selectedIndex === quiz.correctIndex;
