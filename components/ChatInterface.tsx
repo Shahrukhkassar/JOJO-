@@ -110,8 +110,8 @@ export default function ChatInterface() {
   // Voice State
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [selectedVoice, setSelectedVoice] = useState<SpeechSynthesisVoice | null>(null);
-  const [voiceRate, setVoiceRate] = useState(1.0);
-  const [voicePitch, setVoicePitch] = useState(1.08);
+  const [voiceRate, setVoiceRate] = useState(0.98); // Natural conversational speed
+  const [voicePitch, setVoicePitch] = useState(1.0); // Grounded warm natural pitch (no metallic chipmunk effect)
   const [autoSpeak, setAutoSpeak] = useState(true);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [currentlySpeakingId, setCurrentlySpeakingId] = useState<string | null>(null);
@@ -123,9 +123,20 @@ export default function ChatInterface() {
   // Speech Recognition (Mic Input)
   const [isListening, setIsListening] = useState(false);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Stop any active speech and abort pending requests on unmount
+  useEffect(() => {
+    return () => {
+      stopSpeaking();
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, []);
 
   // Scroll to bottom
   const scrollToBottom = () => {
@@ -339,6 +350,18 @@ export default function ChatInterface() {
     const textToSend = (overrideText || input).trim();
     if (!textToSend || loading) return;
 
+    // Immediately stop any active speech on new user input/submission
+    stopSpeaking();
+    setIsSpeaking(false);
+    setCurrentlySpeakingId(null);
+
+    // Cancel any prior in-flight request
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setInput('');
     if (isListening && recognitionRef.current) {
       recognitionRef.current.stop();
@@ -369,22 +392,26 @@ export default function ChatInterface() {
     }
 
     try {
+      const historyPayload = messages.slice(-10).map((m) => ({
+        role: m.role,
+        content: m.content,
+      }));
+
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           message: textToSend,
-          conversationHistory: messages.slice(-8).map((m) => ({
-            role: m.role,
-            content: m.content,
-          })),
+          history: historyPayload,
+          conversationHistory: historyPayload,
           mode: activeMode,
           userMood,
         }),
       });
 
       if (!res.ok) {
-        throw new Error('Network response was not ok');
+        throw new Error(`Server returned ${res.status}`);
       }
 
       const data = await res.json();
@@ -395,7 +422,7 @@ export default function ChatInterface() {
       const assistantMessage: ChatMessage = {
         id: assistantMsgId,
         role: 'assistant',
-        content: data.reply || data.fallbackReply || 'I am here with you ✨',
+        content: data.reply || data.fallbackReply || 'Main yahin hoon tumhare saath ✨',
         emotion: assistantEmotion,
         language: data.language || 'Hinglish',
         gentleCorrection: data.gentleCorrection,
@@ -419,11 +446,15 @@ export default function ChatInterface() {
         }).catch((err) => console.error('Error saving assistant message to Firestore:', err));
       }
 
-      // Auto-speak reply if enabled
+      // Auto-speak reply if enabled (progressive sentence streaming begins immediately)
       if (autoSpeak && assistantMessage.content) {
         handlePlayMessageAudio(assistantMessage);
       }
-    } catch {
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        // User triggered a new prompt or interrupted; do not show error bubble
+        return;
+      }
       const fallbackMsg: ChatMessage = {
         id: createId('assistant-err'),
         role: 'assistant',
@@ -511,6 +542,21 @@ export default function ChatInterface() {
                   ? 'Thinking gently...'
                   : `${currentEmotion} mood`}
               </span>
+              {isSpeaking && (
+                <button
+                  id="header-stop-speaking-btn"
+                  onClick={() => {
+                    stopSpeaking();
+                    setIsSpeaking(false);
+                    setCurrentlySpeakingId(null);
+                  }}
+                  className="ml-1 inline-flex items-center gap-1 text-[10px] font-semibold bg-rose-500 hover:bg-rose-600 text-white px-2 py-0.5 rounded-full shadow-2xs transition-colors cursor-pointer"
+                  title="Stop speech playback"
+                >
+                  <VolumeX className="w-2.5 h-2.5" />
+                  Stop
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -936,7 +982,14 @@ export default function ChatInterface() {
               ref={inputRef}
               rows={1}
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={(e) => {
+                setInput(e.target.value);
+                if (isSpeaking) {
+                  stopSpeaking();
+                  setIsSpeaking(false);
+                  setCurrentlySpeakingId(null);
+                }
+              }}
               onKeyDown={handleKeyDown}
               placeholder={
                 isListening

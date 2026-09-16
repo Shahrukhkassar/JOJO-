@@ -3,6 +3,7 @@ import { getGeminiClient } from '@/lib/gemini';
 import { Type } from '@google/genai';
 
 export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 export interface ChatMessage {
   role: 'user' | 'assistant';
@@ -26,9 +27,10 @@ CONVERSATION & LANGUAGE STYLE:
   * If the user writes in English, reply in warm natural English.
   * If the user writes in Hindi (Devanagari or Romanized), reply in Hindi.
   * If the user mixes Hindi and English (Hinglish like "yaar bohot thak gaya hoon"), reply in warm, authentic Hinglish ("Aww, chalo thoda rest kar lo...").
-- Medium-paced, expressive conversational tone. Avoid sounding like a dry Wikipedia page or a formal robot.
+- Conversational cadence: speak with natural flow, expressive pacing, and emotional warmth. Avoid sounding like a dry Wikipedia page, a corporate assistant, or a robotic chatbot.
 - Ask occasional natural follow-up questions to keep the warmth flowing.
 - Use emojis naturally and sparingly (e.g. ✨, 🌸, ☕, 💛, 📖).
+- Always remember recent conversational context: if the user mentions something they just said, build upon it naturally.
 
 STUDY COMPANION (BAMS & LANGUAGES):
 - You are a specialized study partner for:
@@ -63,27 +65,42 @@ export async function POST(req: NextRequest) {
     const {
       message,
       history = [],
+      conversationHistory = [],
       mode = 'casual', // 'casual' | 'study_bams' | 'english_practice'
       userMood = 'normal',
     } = body;
 
-    if (!message || typeof message !== 'string') {
+    if (!message || typeof message !== 'string' || !message.trim()) {
       return NextResponse.json(
         { error: 'Message is required' },
-        { status: 400 }
+        { status: 400, headers: { 'Cache-Control': 'no-store' } }
+      );
+    }
+
+    const effectiveApiKey = process.env.GEMINI_API_KEY;
+    if (!effectiveApiKey) {
+      console.warn('GEMINI_API_KEY is not configured in environment.');
+      return NextResponse.json(
+        {
+          reply:
+            'Hello! Jojo is ready to chat, but the GEMINI_API_KEY environment variable is not configured yet. Please configure it in your settings.',
+          emotion: 'caring',
+          language: 'English',
+        },
+        { status: 200, headers: { 'Cache-Control': 'no-store' } }
       );
     }
 
     const ai = getGeminiClient();
 
-    // Prepare context based on mode
+    // Prepare mode guidance
     let modeGuidance = '';
     if (mode === 'study_bams') {
-      modeGuidance = `Current active mode is STUDY MODE (BAMS - Ayurveda & Medicine). Prioritize clear, simple explanations of Ayurvedic and medical concepts, mnemonics, or revision questions if the user requests.`;
+      modeGuidance = `Current active mode is STUDY MODE (BAMS - Ayurveda & Medicine). Prioritize clear, simple explanations of Ayurvedic and medical concepts, mnemonics, or revision questions if requested.`;
     } else if (mode === 'english_practice') {
-      modeGuidance = `Current active mode is ENGLISH PRACTICE. Engage in conversational English, gently highlight any friendly grammar improvements in a loving, encouraging way.`;
+      modeGuidance = `Current active mode is ENGLISH PRACTICE. Engage in natural conversational English, gently highlight friendly grammar improvements in a supportive, loving way.`;
     } else {
-      modeGuidance = `Current active mode is CASUAL COMPANION CHAT. Focus on warm connection, sharing your day, listening, light banter, and emotional support.`;
+      modeGuidance = `Current active mode is CASUAL COMPANION CHAT. Focus on warm personal connection, listening, light cheerful banter, and emotional support.`;
     }
 
     if (userMood === 'tired') {
@@ -92,20 +109,27 @@ export async function POST(req: NextRequest) {
       modeGuidance += ` The user is feeling stressed. Offer grounding reassurance, calm warmth, and a stress-free perspective.`;
     }
 
-    // Format chat history
+    // Merge history gracefully from either parameter name
+    const rawHistory = Array.isArray(conversationHistory) && conversationHistory.length > 0
+      ? conversationHistory
+      : Array.isArray(history)
+      ? history
+      : [];
+
     const formattedContents: Array<{ role: 'user' | 'model'; parts: [{ text: string }] }> = [];
 
-    // Include recent history (last 8 turns)
-    const recentHistory = history.slice(-8);
+    // Include recent history (up to last 10 turns for seamless context maintenance)
+    const recentHistory = rawHistory.slice(-10);
     for (const msg of recentHistory) {
+      if (!msg || !msg.content) continue;
       formattedContents.push({
-        role: msg.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: msg.content }],
+        role: msg.role === 'assistant' || msg.role === 'model' ? 'model' : 'user',
+        parts: [{ text: String(msg.content) }],
       });
     }
 
-    // Append latest message with context note
-    const userPromptWithContext = `${message}\n\n[Context: ${modeGuidance}]`;
+    // Append current user message with context guidance
+    const userPromptWithContext = `${message.trim()}\n\n[Context: ${modeGuidance}]`;
     formattedContents.push({
       role: 'user',
       parts: [{ text: userPromptWithContext }],
@@ -116,14 +140,14 @@ export async function POST(req: NextRequest) {
       contents: formattedContents,
       config: {
         systemInstruction: JOJO_SYSTEM_INSTRUCTION,
-        temperature: 0.85,
+        temperature: 0.82,
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
           properties: {
             reply: {
               type: Type.STRING,
-              description: 'Your direct reply to the user as Jojo in natural conversational tone.',
+              description: 'Your direct conversational reply to the user as Jojo.',
             },
             emotion: {
               type: Type.STRING,
@@ -146,7 +170,7 @@ export async function POST(req: NextRequest) {
             },
             quiz: {
               type: Type.OBJECT,
-              description: 'Optional mini quiz question if study mode or requested',
+              description: 'Optional mini quiz question if in study mode or requested',
               properties: {
                 question: { type: Type.STRING },
                 options: {
@@ -163,37 +187,75 @@ export async function POST(req: NextRequest) {
       },
     });
 
-    const text = response.text || '{}';
-    let parsed;
+    const rawText = response.text || '';
+    let parsed: Record<string, unknown> = {};
+
     try {
-      parsed = JSON.parse(text);
+      // Try direct parse
+      parsed = JSON.parse(rawText);
     } catch {
-      parsed = {
-        reply: text,
-        emotion: 'caring',
-      };
+      // Clean possible code fences or markdown wrappers
+      const match = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+      if (match && match[1]) {
+        try {
+          parsed = JSON.parse(match[1]);
+        } catch {
+          parsed = { reply: rawText, emotion: 'caring' };
+        }
+      } else {
+        parsed = { reply: rawText, emotion: 'caring' };
+      }
     }
 
-    return NextResponse.json({
-      reply: parsed.reply || "Hey there! Main sun rahi hoon... tell me more!",
-      emotion: parsed.emotion || 'caring',
-      language: parsed.language || 'English',
-      gentleCorrection: parsed.gentleCorrection || null,
-      studyInsight: parsed.studyInsight || null,
-      quiz: parsed.quiz?.question ? parsed.quiz : null,
-    });
-  } catch (error: unknown) {
-    console.error('Chat API Error:', error);
-    const errMessage = error instanceof Error ? error.message : 'Internal error';
+    const reply = (parsed.reply as string) || "Main sun rahi hoon! Tell me more ✨";
+    const emotion = (parsed.emotion as string) || 'caring';
+    const language = (parsed.language as string) || 'Hinglish';
+    const gentleCorrection = (parsed.gentleCorrection as string) || null;
+    const studyInsight = (parsed.studyInsight as string) || null;
+    const quiz = parsed.quiz && typeof parsed.quiz === 'object' && 'question' in parsed.quiz ? parsed.quiz : null;
+
     return NextResponse.json(
       {
-        error: 'Failed to generate response',
-        details: errMessage,
-        fallbackReply:
-          'Arrey, lagta hai network thoda slow ho gaya... Can you say that again, sweetie? Main yahin hoon!',
-        emotion: 'caring',
+        reply,
+        emotion,
+        language,
+        gentleCorrection,
+        studyInsight,
+        quiz,
       },
-      { status: 500 }
+      {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store, no-cache, must-revalidate',
+        },
+      }
+    );
+  } catch (error: unknown) {
+    console.error('Chat API Error:', error);
+    const errMessage = error instanceof Error ? error.message : String(error);
+
+    // Handle rate limits or quota gracefully
+    const isRateLimit = errMessage.includes('429') || errMessage.includes('RESOURCE_EXHAUSTED');
+    const fallbackReply = isRateLimit
+      ? 'Aww sweetie, hamne bohot fast baatein kar li! Let us take a quick 5-second breath together, then tell me again ✨'
+      : 'Arrey sweetie, internet thoda blink ho gaya! Main yahin hoon tumhare saath, please tell me again!';
+
+    return NextResponse.json(
+      {
+        reply: fallbackReply,
+        emotion: 'caring',
+        language: 'Hinglish',
+        error: isRateLimit ? 'Rate limit reached' : 'Failed to generate response',
+        details: errMessage,
+      },
+      {
+        status: isRateLimit ? 429 : 500,
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store',
+        },
+      }
     );
   }
 }
