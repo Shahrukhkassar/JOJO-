@@ -1,0 +1,10 @@
+{
+  "name": "Jojo - AI Companion",
+  "description": "A warm, charming, emotionally expressive AI companion and study partner.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
